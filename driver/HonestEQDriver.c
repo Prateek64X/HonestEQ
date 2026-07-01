@@ -48,9 +48,14 @@ enum {
     kObjectID_PlugIn               = kAudioObjectPlugInObject,  // 1, Apple-defined
     kObjectID_Device               = 2,
     kObjectID_Stream_Output        = 3,
-    kObjectID_Volume_Output_Master = 4,
-    kObjectID_Mute_Output_Master   = 5,
-    kObjectID_Stream_Input         = 6,     // pass 3: loopback stream for the companion app
+    // Volume + mute IDs remain defined for the (now-dead) control_* handlers,
+    // but we no longer advertise them in owned_objects / control_list — macOS
+    // therefore falls back to its software mixer for the system-volume
+    // slider, which stays in sync with actual output. The handlers are
+    // unreachable at runtime; the enum values just keep the file compiling.
+    kObjectID_Volume_Output_Master = 4,     // not advertised — see above
+    kObjectID_Mute_Output_Master   = 5,     // not advertised — see above
+    kObjectID_Stream_Input         = 6,     // loopback stream for the daemon
 };
 
 // ---------------------------------------------------------------------------
@@ -286,7 +291,7 @@ static OSStatus device_GetPropertyDataSize(const AudioObjectPropertyAddress* a, 
         case kAudioDevicePropertyModelUID:
             EMIT_SIZE(sizeof(CFStringRef));
         case kAudioObjectPropertyOwnedObjects: {
-            // device owns: 2 streams (in+out) + 1 volume + 1 mute = 4
+            // device owns: 2 streams (in + out) + master volume + master mute.
             EMIT_SIZE(4 * sizeof(AudioObjectID));
         }
         case kAudioDevicePropertyStreams: {
@@ -709,6 +714,19 @@ static OSStatus control_IsPropertySettable(AudioObjectID id,
     return kAudioHardwareNoError;
 }
 
+// Send a property-changed notification back to coreaudiod so the system UI
+// (Control Center slider, menu-bar volume badge, etc.) refreshes.
+static void notify_property_changed(AudioObjectID id,
+                                    AudioObjectPropertySelector sel) {
+    if (!gDriver.host) return;
+    AudioObjectPropertyAddress changed = {
+        .mSelector = sel,
+        .mScope    = kAudioObjectPropertyScopeGlobal,
+        .mElement  = kAudioObjectPropertyElementMain,
+    };
+    gDriver.host->PropertiesChanged(gDriver.host, id, 1, &changed);
+}
+
 static OSStatus control_SetPropertyData(AudioObjectID id,
                                         const AudioObjectPropertyAddress* a,
                                         UInt32 in_data_size, const void* in_data) {
@@ -720,6 +738,10 @@ static OSStatus control_SetPropertyData(AudioObjectID id,
             pthread_mutex_lock(&gDriver.state_mutex);
             gDriver.output_master_volume = v;
             pthread_mutex_unlock(&gDriver.state_mutex);
+            // Tell macOS both the scalar and dB value changed — one call per
+            // selector so the UI, menu-bar badge, and Accessibility all update.
+            notify_property_changed(id, kAudioLevelControlPropertyScalarValue);
+            notify_property_changed(id, kAudioLevelControlPropertyDecibelValue);
             return kAudioHardwareNoError;
         }
         if (a->mSelector == kAudioLevelControlPropertyDecibelValue) {
@@ -730,6 +752,8 @@ static OSStatus control_SetPropertyData(AudioObjectID id,
             pthread_mutex_lock(&gDriver.state_mutex);
             gDriver.output_master_volume = scalar;
             pthread_mutex_unlock(&gDriver.state_mutex);
+            notify_property_changed(id, kAudioLevelControlPropertyScalarValue);
+            notify_property_changed(id, kAudioLevelControlPropertyDecibelValue);
             return kAudioHardwareNoError;
         }
     }
@@ -740,6 +764,7 @@ static OSStatus control_SetPropertyData(AudioObjectID id,
             pthread_mutex_lock(&gDriver.state_mutex);
             gDriver.output_master_mute = (v != 0);
             pthread_mutex_unlock(&gDriver.state_mutex);
+            notify_property_changed(id, kAudioBooleanControlPropertyValue);
             return kAudioHardwareNoError;
         }
     }
@@ -1032,19 +1057,19 @@ static OSStatus HonestEQ_DoIOOperation(AudioServerPlugInDriverRef self,
     (void)self; (void)dev; (void)stream; (void)cid; (void)secondary;
     if (main == NULL || info == NULL) return kAudioHardwareNoError;
 
-    // Apply master mute/volume to the audio as it flows through.
-    pthread_mutex_lock(&gDriver.state_mutex);
-    const bool  muted = gDriver.output_master_mute;
-    const float vol   = gDriver.output_master_volume;
-    pthread_mutex_unlock(&gDriver.state_mutex);
-
     Float32* buf = (Float32*)main;
 
     if (op == kAudioServerPlugInIOOperationWriteMix) {
-        // Apps have written `frames` * 2 samples of Float32 into `buf`.
-        // Copy them into the ring at the current output sample time.
-        const UInt64 base = (UInt64)info->mOutputTime.mSampleTime;
+        // Apply the driver's master volume + mute to incoming audio.
+        // The macOS system-volume slider talks to our master volume control,
+        // which stores here; we multiply on the way into the ring.
+        pthread_mutex_lock(&gDriver.state_mutex);
+        const bool  muted = gDriver.output_master_mute;
+        const float vol   = gDriver.output_master_volume;
+        pthread_mutex_unlock(&gDriver.state_mutex);
         const float g = muted ? 0.0f : vol;
+
+        const UInt64 base = (UInt64)info->mOutputTime.mSampleTime;
         for (UInt32 i = 0; i < frames; ++i) {
             const UInt64 idx = ((base + i) % kRingFrames) * kChannels;
             gRing[idx + 0] = buf[i * kChannels + 0] * g;

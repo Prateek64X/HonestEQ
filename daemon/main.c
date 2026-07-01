@@ -33,6 +33,11 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "EqBridge.hpp"
+
+// The DSP engine. Instantiated at startup, updated on rate changes.
+static EqBridge* gEq = NULL;
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -417,6 +422,10 @@ static OSStatus input_callback(void* user_data,
     OSStatus s = AudioUnitRender(input_unit, flags, ts, bus, frames, &list);
     if (s != noErr) return s;
 
+    // Apply the EQ to the samples before they hit the ring. This keeps the
+    // ring holding already-processed audio; the output side is pure playback.
+    eq_bridge_process_interleaved(gEq, scratch, frames);
+
     // Diagnostic tap: save the first ~15 seconds to a WAV for offline inspection.
     if (gDumpFramesLimit > 0 && gDumpFramesWritten < gDumpFramesLimit) {
         UInt64 space = gDumpFramesLimit - gDumpFramesWritten;
@@ -546,6 +555,11 @@ static void rebuild_pipeline(void) {
     gDumpFramesWritten = 0;
     gDumpFramesLimit   = (uint64_t)(gSampleRate * kDumpSecondsLimit);
 
+    // Push the new rate into the DSP so all biquad coefficients get
+    // recomputed for the new Fs. Filter shape is preserved; the analytic
+    // response at any Hz is unchanged, but the discrete coefficients change.
+    if (gEq) eq_bridge_set_sample_rate(gEq, gSampleRate);
+
     // Rebuild fresh at the new rate. make_asbd() reads gSampleRate.
     gInputUnit  = setup_auhal(gHonestEQ_ID, 1);
     configure_input_callback(gInputUnit);
@@ -650,6 +664,32 @@ int main(int argc, char** argv) {
 
     // Set the 15-second dump limit based on the actual sample rate.
     gDumpFramesLimit = (uint64_t)(gSampleRate * kDumpSecondsLimit);
+
+    // --- DSP setup -------------------------------------------------------
+    // Instantiate the EQ engine and load a profile.
+    // Default location: ~/Library/Application Support/HonestEQ/active_profile.txt
+    // If missing, daemon runs as passthrough (still applies rate-following
+    // and clean routing, just no filtering).
+    gEq = eq_bridge_create(gSampleRate);
+    if (gEq == NULL) {
+        fprintf(stderr, "ERROR: failed to create EQ engine.\n");
+        return 4;
+    }
+    char profile_path[1024];
+    const char* home = getenv("HOME");
+    snprintf(profile_path, sizeof(profile_path),
+             "%s/Library/Application Support/HonestEQ/active_profile.txt",
+             home ? home : "/tmp");
+    if (eq_bridge_load_profile(gEq, profile_path) == 0 &&
+        eq_bridge_has_profile(gEq)) {
+        fprintf(stderr, "EQ profile loaded: %s\n", profile_path);
+        fprintf(stderr, "  Bands: %d, Preamp: %+.2f dB\n",
+                eq_bridge_band_count(gEq), eq_bridge_preamp_db(gEq));
+    } else {
+        fprintf(stderr, "No EQ profile at %s — running passthrough.\n", profile_path);
+        fprintf(stderr, "  Drop a Peace/Equalizer APO config there and restart the daemon.\n");
+    }
+    // ---------------------------------------------------------------------
     if ((Float64)gSampleRate != out_rate) {
         fprintf(stderr, "  Note: rates differ — AUHAL will resample internally.\n");
     }
@@ -708,8 +748,13 @@ int main(int argc, char** argv) {
         }
     }
 
-    fprintf(stderr, "HonestEQ daemon running (stage 1: passthrough, no DSP yet).\n"
-                    "Select 'HonestEQ' as system output; audio will come out of '%s'.\n"
+    if (eq_bridge_has_profile(gEq)) {
+        fprintf(stderr, "HonestEQ daemon running — DSP active (%d bands, preamp %+0.2f dB).\n",
+                eq_bridge_band_count(gEq), eq_bridge_preamp_db(gEq));
+    } else {
+        fprintf(stderr, "HonestEQ daemon running — passthrough (no profile loaded).\n");
+    }
+    fprintf(stderr, "Select 'HonestEQ' as system output; audio will come out of '%s'.\n"
                     "Press Ctrl-C to stop.\n\n", argv[1]);
 
     // Diagnostic thread: print ring stats every 2 seconds.
