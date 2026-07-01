@@ -14,6 +14,17 @@
 
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
+
+// AudioServerPlugIn.h doesn't expose the buffer-frame-size property selectors
+// (they live in the client-side AudioHardware.h, which we can't include in a
+// driver context). Apple's canonical four-char codes are stable — define
+// them manually so AUHAL clients can query/set them on our device.
+#ifndef kAudioDevicePropertyBufferFrameSize
+#define kAudioDevicePropertyBufferFrameSize        ((AudioObjectPropertySelector)'fsiz')
+#endif
+#ifndef kAudioDevicePropertyBufferFrameSizeRange
+#define kAudioDevicePropertyBufferFrameSizeRange   ((AudioObjectPropertySelector)'fsz#')
+#endif
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -81,6 +92,7 @@ typedef struct {
     pthread_mutex_t                     state_mutex;
     Float64                             sample_rate;
     UInt32                              io_running_count;
+    UInt32                              buffer_frame_size;   // AUHAL callback size
 
     UInt64                              io_anchor_host_time;
     Float64                             io_anchor_sample;
@@ -88,6 +100,10 @@ typedef struct {
     Float32                             output_master_volume;   // 0.0..1.0
     bool                                output_master_mute;
 } HonestEQ_Driver;
+
+// Min / max buffer frame sizes we advertise + accept.
+#define kMinBufferFrames  (32)
+#define kMaxBufferFrames  (8192)
 
 static HonestEQ_Driver gDriver;
 
@@ -241,6 +257,8 @@ static Boolean device_HasProperty(const AudioObjectPropertyAddress* a) {
         case kAudioDevicePropertyZeroTimeStampPeriod:
         case kAudioDevicePropertyPreferredChannelsForStereo:
         case kAudioDevicePropertyPreferredChannelLayout:
+        case kAudioDevicePropertyBufferFrameSize:
+        case kAudioDevicePropertyBufferFrameSizeRange:
             return true;
     }
     return false;
@@ -291,6 +309,10 @@ static OSStatus device_GetPropertyDataSize(const AudioObjectPropertyAddress* a, 
             EMIT_SIZE(2 * sizeof(UInt32));
         case kAudioDevicePropertyPreferredChannelLayout:
             EMIT_SIZE(sizeof(AudioChannelLayout));
+        case kAudioDevicePropertyBufferFrameSize:
+            EMIT_SIZE(sizeof(UInt32));
+        case kAudioDevicePropertyBufferFrameSizeRange:
+            EMIT_SIZE(sizeof(AudioValueRange));
     }
     return kAudioHardwareUnknownPropertyError;
 }
@@ -397,12 +419,27 @@ static OSStatus device_GetPropertyData(const AudioObjectPropertyAddress* a,
             layout.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo;
             EMIT(layout, AudioChannelLayout);
         }
+        case kAudioDevicePropertyBufferFrameSize: {
+            pthread_mutex_lock(&gDriver.state_mutex);
+            UInt32 v = gDriver.buffer_frame_size;
+            pthread_mutex_unlock(&gDriver.state_mutex);
+            if (v == 0) v = 512;   // default if not yet set
+            EMIT(v, UInt32);
+        }
+        case kAudioDevicePropertyBufferFrameSizeRange: {
+            AudioValueRange r = {
+                .mMinimum = (Float64)kMinBufferFrames,
+                .mMaximum = (Float64)kMaxBufferFrames,
+            };
+            EMIT(r, AudioValueRange);
+        }
     }
     return kAudioHardwareUnknownPropertyError;
 }
 
 static OSStatus device_IsPropertySettable(const AudioObjectPropertyAddress* a, Boolean* settable) {
-    *settable = (a->mSelector == kAudioDevicePropertyNominalSampleRate);
+    *settable = (a->mSelector == kAudioDevicePropertyNominalSampleRate ||
+                 a->mSelector == kAudioDevicePropertyBufferFrameSize);
     return kAudioHardwareNoError;
 }
 
@@ -431,6 +468,16 @@ static OSStatus device_SetPropertyData(const AudioObjectPropertyAddress* a,
             gDriver.host->RequestDeviceConfigurationChange(
                 gDriver.host, kObjectID_Device, (UInt64)requested, NULL);
         }
+        return kAudioHardwareNoError;
+    }
+    if (a->mSelector == kAudioDevicePropertyBufferFrameSize) {
+        if (in_data_size < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+        UInt32 requested = *(const UInt32*)in_data;
+        if (requested < kMinBufferFrames) requested = kMinBufferFrames;
+        if (requested > kMaxBufferFrames) requested = kMaxBufferFrames;
+        pthread_mutex_lock(&gDriver.state_mutex);
+        gDriver.buffer_frame_size = requested;
+        pthread_mutex_unlock(&gDriver.state_mutex);
         return kAudioHardwareNoError;
     }
     return kAudioHardwareUnknownPropertyError;
@@ -740,6 +787,7 @@ static OSStatus HonestEQ_Initialize(AudioServerPlugInDriverRef self,
     (void)self;
     gDriver.host = host;
     gDriver.sample_rate = 48000.0;
+    gDriver.buffer_frame_size = 512;   // AUHAL will override via SetProperty
     gDriver.output_master_volume = 1.0f;
     gDriver.output_master_mute = false;
     gDriver.io_running_count = 0;

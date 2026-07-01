@@ -43,10 +43,11 @@
 static double gSampleRate = 48000.0;
 
 #define kChannels         2
-// 524288 frames = ~10.9 s at 48 kHz, ~2.7 s at 192 kHz. Big enough that a
-// 1-second prime always fits, and that clock drift at any supported rate
-// won't wrap the ring for many seconds.  Static allocation: 4 MB.
-#define kRingFrames       (524288)
+// 65536 frames = ~1.37 s at 48 kHz, ~341 ms at 192 kHz. Comfortably above
+// the "target + jump threshold + one callback burst" worst case at every
+// supported rate — ~15× safety margin at 192 kHz, more at lower rates.
+// Static allocation: 512 KB. Same size as the driver-side ring.
+#define kRingFrames       (65536)
 #define kRingSamples      (kRingFrames * kChannels)
 #define kHonestEQ_UID     CFSTR("HonestEQDevice_UID")
 
@@ -81,21 +82,28 @@ typedef struct {
 
 static Ring gRing;
 
-// How far behind the writer the reader starts.
-// After a rate change we prime the ring with ~1 second of silence and let the
-// writer fill it up before real audio comes out. If the writer takes a bit
-// longer to stabilize (2-3 s), the reader plays silence — no glitches.
-// The value scales with gSampleRate at rebuild time.
-#define kInitialPrimeFrames_Base  (48000)   // ~1 second at 48 kHz
+// Ultra-low-latency mode.
+// Reader stays this many frames behind writer in steady state.
+// Floor: 128 frames (matches the AUHAL callback size we pin below), which is
+// ~2.7 ms at 48 kHz. Higher rates scale up to maintain ~2.7 ms of headroom.
+#define kAUHALFramesPerCallback (128)
+#define kTargetOffsetFramesMin  (kAUHALFramesPerCallback)
+#define kTargetOffsetSeconds    (128.0 / 48000.0)   // ~2.67 ms
+// If reader falls behind writer by more than this, JUMP forward to
+// (write - target) and drop the backlog. 4× target keeps jumps rare.
+#define kJumpThresholdMultiple  (4)
+
+static inline uint64_t compute_target_offset(void) {
+    uint64_t by_time = (uint64_t)(gSampleRate * kTargetOffsetSeconds);
+    return (by_time < kTargetOffsetFramesMin) ? kTargetOffsetFramesMin : by_time;
+}
 
 static void ring_reset(Ring* r) {
     memset(r->data, 0, sizeof(r->data));
-    // Prime by ~1 second at current rate — reader plays silence while writer
-    // fills the ring after a startup or rate change.
-    uint64_t prime = (uint64_t)gSampleRate;  // 1 second's worth of frames
-    if (prime < kInitialPrimeFrames_Base) prime = kInitialPrimeFrames_Base;
-    if (prime > kRingFrames / 2) prime = kRingFrames / 2;
-    atomic_store(&r->write_frame, prime);
+    // No prime — reader and writer both start at 0. Reader emits silence
+    // until writer produces data (a few ms at startup / after rate change),
+    // then the catch-up logic in ring_read snaps reader to (writer - target).
+    atomic_store(&r->write_frame, 0);
     atomic_store(&r->read_frame,  0);
     atomic_store(&r->underrun_count, 0);
     atomic_store(&r->total_read, 0);
@@ -131,6 +139,16 @@ static void ring_write(Ring* r, const float* src, UInt32 frames) {
 static void ring_read(Ring* r, float* dst, UInt32 frames) {
     uint64_t rd = atomic_load_explicit(&r->read_frame,  memory_order_relaxed);
     uint64_t w  = atomic_load_explicit(&r->write_frame, memory_order_acquire);
+
+    // Catch-up: if reader is far behind writer (accumulated backlog from
+    // startup, rate change, or transient stall), jump forward to always
+    // play "current" audio. Target/threshold scale with sample rate.
+    uint64_t target = compute_target_offset();
+    uint64_t threshold = target * kJumpThresholdMultiple;
+    if (w > rd && (w - rd) > threshold) {
+        rd = w - target;
+    }
+
     float last_l = r->last_l, last_r = r->last_r;
     float peak = 0.0f;
     for (UInt32 i = 0; i < frames; ++i) {
@@ -156,7 +174,16 @@ static void ring_read(Ring* r, float* dst, UInt32 frames) {
     uint32_t p = (uint32_t)(peak * 1000000.0f);
     uint32_t cur = atomic_load_explicit(&r->peak_out_x1e6, memory_order_relaxed);
     if (p > cur) atomic_store_explicit(&r->peak_out_x1e6, p, memory_order_relaxed);
-    atomic_store_explicit(&r->read_frame, rd + frames, memory_order_relaxed);
+    // Advance read_frame to (rd + frames), but never past the writer's
+    // position. This is the key invariant: reader can lag writer (that's
+    // where our target offset lives) but must never lead it. If we asked
+    // for more frames than the ring had, the excess were played as
+    // held-silence, and we simply stay at the writer's edge until it
+    // produces more — instead of accumulating a permanent lead that
+    // creates continuous underruns.
+    uint64_t new_rd = rd + frames;
+    if (new_rd > w) new_rd = w;
+    atomic_store_explicit(&r->read_frame, new_rd, memory_order_relaxed);
     atomic_fetch_add_explicit(&r->total_read, frames, memory_order_relaxed);
 }
 
@@ -445,6 +472,28 @@ static AudioUnit setup_auhal(AudioObjectID device_id, int dir) {
     CHECK(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
                                kAudioUnitScope_Global, 0, &device_id, sizeof(device_id)),
           "bind device");
+
+    // Pin AUHAL's callback buffer size to kAUHALFramesPerCallback for
+    // ultra-low-latency operation. If the device rejects it (e.g. can't go
+    // that low), AUHAL falls back to its nearest supported size — we log
+    // but don't fail. Then read back to confirm what we actually got.
+    {
+        UInt32 preferred = kAUHALFramesPerCallback;
+        OSStatus s = AudioUnitSetProperty(unit, kAudioDevicePropertyBufferFrameSize,
+                                          kAudioUnitScope_Global, 0,
+                                          &preferred, sizeof(preferred));
+        UInt32 actual = 0;
+        UInt32 sz = sizeof(actual);
+        AudioUnitGetProperty(unit, kAudioDevicePropertyBufferFrameSize,
+                             kAudioUnitScope_Global, 0, &actual, &sz);
+        if (s != noErr) {
+            fprintf(stderr, "  (info) BufferFrameSize=%u refused (status=%d); AUHAL running at %u frames.\n",
+                    preferred, (int)s, actual);
+        } else {
+            fprintf(stderr, "  BufferFrameSize on %s AUHAL = %u frames\n",
+                    (dir == 1) ? "input" : "output", actual);
+        }
+    }
 
     AudioStreamBasicDescription asbd = make_asbd();
     if (dir == 1) {
