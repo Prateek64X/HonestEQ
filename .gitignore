@@ -1,0 +1,27 @@
+# Build outputs
+build/
+build-*/
+*.o
+*.a
+*.dylib
+*.so
+*.driver
+
+# macOS
+.DS_Store
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+DerivedData/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Editors
+*.swp
+.vscode/
+.idea/
+.cursorignore
+
+# Local scratch
+*.local
+scratch/

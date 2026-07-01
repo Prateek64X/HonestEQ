@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+
+    <key>CFBundleExecutable</key>
+    <string>HonestEQ</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>com.honesteq.driver</string>
+
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+
+    <key>CFBundleName</key>
+    <string>HonestEQ</string>
+
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <key>NSHumanReadableCopyright</key>
+    <string>HonestEQ — open source system-wide parametric EQ for macOS.</string>
+
+    <!-- CFPlugIn registration. The factory function below is called by
+         CFPlugInInstanceCreate(coreaudiod) when the plugin is requested. -->
+    <key>CFPlugInDynamicRegistration</key>
+    <string>NO</string>
+
+    <key>CFPlugInFactories</key>
+    <dict>
+        <!-- This UUID identifies our factory function. Must match the
+             kFactoryUUID constant in HonestEQDriver.c. -->
+        <key>9F3F1D89-5C0A-4F0E-9C7D-1F1A0E3D5A7B</key>
+        <string>HonestEQ_Create</string>
+    </dict>
+
+    <key>CFPlugInTypes</key>
+    <dict>
+        <!-- 443ABAB8-E7B3-491A-B985-BEB9187030DB = kAudioServerPlugInTypeUUID
+             (defined in <CoreAudio/AudioServerPlugIn.h>) -->
+        <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+        <array>
+            <string>9F3F1D89-5C0A-4F0E-9C7D-1F1A0E3D5A7B</string>
+        </array>
+    </dict>
+</dict>
+</plist>
