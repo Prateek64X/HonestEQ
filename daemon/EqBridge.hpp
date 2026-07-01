@@ -41,6 +41,10 @@ int       eq_bridge_has_profile(const EqBridge* eq);
 int       eq_bridge_band_count(const EqBridge* eq);
 double    eq_bridge_preamp_db(const EqBridge* eq);
 
+// Override the preamp value (dB) at runtime. Replaces whatever the profile
+// specified. Useful for a --preamp CLI flag or a future GUI slider.
+void      eq_bridge_set_preamp_db(EqBridge* eq, double db);
+
 #ifdef __cplusplus
 }
 #endif

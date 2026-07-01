@@ -581,13 +581,24 @@ static void rebuild_pipeline(void) {
 // ---------------------------------------------------------------------------
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
+    if (argc < 2) {
         fprintf(stderr,
-            "usage: %s <output-device-name>\n"
-            "  e.g. %s \"External Headphones\"\n\n",
-            argv[0], argv[0]);
+            "usage: %s <output-device-name> [--preamp DB]\n"
+            "  e.g. %s \"External Headphones\"\n"
+            "       %s \"External Headphones\" --preamp -6\n\n",
+            argv[0], argv[0], argv[0]);
         list_devices();
         return 1;
+    }
+
+    // Optional --preamp flag to override whatever the profile says.
+    double preamp_override_db = 0.0;
+    bool   preamp_override_set = false;
+    for (int i = 2; i < argc; ++i) {
+        if (strcmp(argv[i], "--preamp") == 0 && i + 1 < argc) {
+            preamp_override_db = atof(argv[++i]);
+            preamp_override_set = true;
+        }
     }
 
     // Find HonestEQ (the source of audio we consume).
@@ -688,6 +699,10 @@ int main(int argc, char** argv) {
     } else {
         fprintf(stderr, "No EQ profile at %s — running passthrough.\n", profile_path);
         fprintf(stderr, "  Drop a Peace/Equalizer APO config there and restart the daemon.\n");
+    }
+    if (preamp_override_set) {
+        eq_bridge_set_preamp_db(gEq, preamp_override_db);
+        fprintf(stderr, "  Preamp overridden via --preamp: %+.2f dB\n", preamp_override_db);
     }
     // ---------------------------------------------------------------------
     if ((Float64)gSampleRate != out_rate) {

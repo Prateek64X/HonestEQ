@@ -87,3 +87,9 @@ extern "C" int eq_bridge_band_count(const EqBridge* eq) {
 extern "C" double eq_bridge_preamp_db(const EqBridge* eq) {
     return eq ? eq->preamp_db : 0.0;
 }
+
+extern "C" void eq_bridge_set_preamp_db(EqBridge* eq, double db) {
+    if (!eq) return;
+    eq->preamp_db = db;
+    eq->chain.setPreampDb(db);
+}
