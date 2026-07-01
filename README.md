@@ -1,0 +1,2 @@
+# HonestEQ
+HonestEQ for mac
