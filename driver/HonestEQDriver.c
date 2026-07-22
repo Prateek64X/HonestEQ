@@ -25,11 +25,14 @@
 #ifndef kAudioDevicePropertyBufferFrameSizeRange
 #define kAudioDevicePropertyBufferFrameSizeRange   ((AudioObjectPropertySelector)'fsz#')
 #endif
+#include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 // ---------------------------------------------------------------------------
 // UUID — must match Info.plist's CFPlugInFactories key.
@@ -661,8 +664,9 @@ static OSStatus control_GetPropertyData(AudioObjectID id,
                 pthread_mutex_lock(&gDriver.state_mutex);
                 Float32 scalar = gDriver.output_master_volume;
                 pthread_mutex_unlock(&gDriver.state_mutex);
+                // Match the cubic taper used in WriteMix: dB = 20*log10(scalar^3) = 60*log10(scalar)
                 Float32 db = (scalar <= 0.00001f) ? -96.0f
-                              : 20.0f * log10f(scalar);
+                              : 60.0f * log10f(scalar);
                 EMIT(db, Float32);
             }
             case kAudioLevelControlPropertyDecibelRange: {
@@ -672,13 +676,15 @@ static OSStatus control_GetPropertyData(AudioObjectID id,
             case kAudioLevelControlPropertyConvertScalarToDecibels: {
                 if (in_data_size < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
                 Float32 scalar = *(const Float32*)out_data;
-                Float32 db = (scalar <= 0.00001f) ? -96.0f : 20.0f * log10f(scalar);
+                // Cubic taper: dB = 20*log10(scalar^3) = 60*log10(scalar)
+                Float32 db = (scalar <= 0.00001f) ? -96.0f : 60.0f * log10f(scalar);
                 EMIT(db, Float32);
             }
             case kAudioLevelControlPropertyConvertDecibelsToScalar: {
                 if (in_data_size < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
                 Float32 db = *(const Float32*)out_data;
-                Float32 scalar = powf(10.0f, db / 20.0f);
+                // Inverse of the cubic taper: scalar = 10^(dB/60)
+                Float32 scalar = powf(10.0f, db / 60.0f);
                 EMIT(scalar, Float32);
             }
         }
@@ -714,6 +720,11 @@ static OSStatus control_IsPropertySettable(AudioObjectID id,
     return kAudioHardwareNoError;
 }
 
+// Forward decl — defined later in the "State persistence" section. Called
+// from the volume/mute SetProperty handlers so any change is coalesced into
+// a single debounced disk write.
+static void driver_state_mark_dirty(void);
+
 // Send a property-changed notification back to coreaudiod so the system UI
 // (Control Center slider, menu-bar volume badge, etc.) refreshes.
 static void notify_property_changed(AudioObjectID id,
@@ -742,18 +753,22 @@ static OSStatus control_SetPropertyData(AudioObjectID id,
             // selector so the UI, menu-bar badge, and Accessibility all update.
             notify_property_changed(id, kAudioLevelControlPropertyScalarValue);
             notify_property_changed(id, kAudioLevelControlPropertyDecibelValue);
+            // Debounced persist so this survives a coreaudiod reload.
+            driver_state_mark_dirty();
             return kAudioHardwareNoError;
         }
         if (a->mSelector == kAudioLevelControlPropertyDecibelValue) {
             if (in_data_size < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
             Float32 db = *(const Float32*)in_data;
-            Float32 scalar = powf(10.0f, db / 20.0f);
+            // Cubic taper inverse: scalar = 10^(dB/60)
+            Float32 scalar = powf(10.0f, db / 60.0f);
             if (scalar < 0) scalar = 0; if (scalar > 1) scalar = 1;
             pthread_mutex_lock(&gDriver.state_mutex);
             gDriver.output_master_volume = scalar;
             pthread_mutex_unlock(&gDriver.state_mutex);
             notify_property_changed(id, kAudioLevelControlPropertyScalarValue);
             notify_property_changed(id, kAudioLevelControlPropertyDecibelValue);
+            driver_state_mark_dirty();
             return kAudioHardwareNoError;
         }
     }
@@ -765,6 +780,7 @@ static OSStatus control_SetPropertyData(AudioObjectID id,
             gDriver.output_master_mute = (v != 0);
             pthread_mutex_unlock(&gDriver.state_mutex);
             notify_property_changed(id, kAudioBooleanControlPropertyValue);
+            driver_state_mark_dirty();
             return kAudioHardwareNoError;
         }
     }
@@ -804,6 +820,138 @@ static ULONG HonestEQ_Release(void* self) {
 }
 
 // ---------------------------------------------------------------------------
+// State persistence (volume + mute).
+//
+// Volume and mute live in-memory in gDriver, so a coreaudiod reload (macOS
+// updates, `killall coreaudiod`, sleep-wake edge cases) would reset them
+// to defaults. That's annoying — user's carefully chosen volume level
+// disappears without warning.
+//
+// Fix: persist the two Float32/bool values to a small property list at
+//   /Library/Application Support/HonestEQ/driver-state.plist
+// The parent dir is created world-writable (0777) by the install script so
+// coreaudiod (running as _coreaudiod) can write here without escalation.
+//
+// Writes are debounced 500 ms — dragging the volume slider fires dozens of
+// SetProperty events per second, but only one write hits disk.
+// ---------------------------------------------------------------------------
+
+#define kDriverStateDir  "/Library/Application Support/HonestEQ"
+#define kDriverStatePath "/Library/Application Support/HonestEQ/driver-state.plist"
+
+static _Atomic bool g_state_save_pending = false;
+
+// Read plist off disk into gDriver's volume/mute. Called once at driver init.
+// Missing / corrupt file → silently keep defaults (1.0 / unmuted).
+static void driver_state_load(void) {
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+        NULL, (const UInt8*)kDriverStatePath, strlen(kDriverStatePath), false);
+    if (!url) return;
+
+    CFReadStreamRef stream = CFReadStreamCreateWithFile(NULL, url);
+    CFRelease(url);
+    if (!stream || !CFReadStreamOpen(stream)) {
+        if (stream) CFRelease(stream);
+        return;
+    }
+
+    CFPropertyListRef plist = CFPropertyListCreateWithStream(
+        NULL, stream, 0, kCFPropertyListImmutable, NULL, NULL);
+    CFReadStreamClose(stream);
+    CFRelease(stream);
+    if (!plist) return;
+    if (CFGetTypeID(plist) != CFDictionaryGetTypeID()) {
+        CFRelease(plist);
+        return;
+    }
+
+    CFDictionaryRef dict = (CFDictionaryRef)plist;
+
+    CFNumberRef vol_num = (CFNumberRef)CFDictionaryGetValue(dict, CFSTR("volumeScalar"));
+    if (vol_num && CFGetTypeID(vol_num) == CFNumberGetTypeID()) {
+        double v = 1.0;
+        if (CFNumberGetValue(vol_num, kCFNumberDoubleType, &v)) {
+            if (v < 0.0) v = 0.0;
+            if (v > 1.0) v = 1.0;
+            gDriver.output_master_volume = (Float32)v;
+        }
+    }
+
+    CFBooleanRef muted_bool = (CFBooleanRef)CFDictionaryGetValue(dict, CFSTR("muted"));
+    if (muted_bool && CFGetTypeID(muted_bool) == CFBooleanGetTypeID()) {
+        gDriver.output_master_mute = CFBooleanGetValue(muted_bool);
+    }
+
+    CFRelease(plist);
+}
+
+// Serialize current volume/mute to the state plist. Atomic write:
+// write to a .tmp file, then rename() over the target. Guarantees the
+// state file is never observed in a half-written state, even if the process
+// is killed or the machine loses power mid-write.
+static void driver_state_write_synchronous(void) {
+    Float32 vol;
+    bool    muted;
+    pthread_mutex_lock(&gDriver.state_mutex);
+    vol   = gDriver.output_master_volume;
+    muted = gDriver.output_master_mute;
+    pthread_mutex_unlock(&gDriver.state_mutex);
+
+    CFMutableDictionaryRef dict = CFDictionaryCreateMutable(
+        NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (!dict) return;
+
+    double v = (double)vol;
+    CFNumberRef vol_num = CFNumberCreate(NULL, kCFNumberDoubleType, &v);
+    if (vol_num) {
+        CFDictionarySetValue(dict, CFSTR("volumeScalar"), vol_num);
+        CFRelease(vol_num);
+    }
+    CFDictionarySetValue(dict, CFSTR("muted"),
+                         muted ? kCFBooleanTrue : kCFBooleanFalse);
+
+    CFDataRef data = CFPropertyListCreateData(
+        NULL, dict, kCFPropertyListXMLFormat_v1_0, 0, NULL);
+    CFRelease(dict);
+    if (!data) return;
+
+    // Ensure the parent dir exists (install script normally creates it,
+    // but if a user removes it we recreate best-effort).
+    mkdir(kDriverStateDir, 0777);
+
+    const char* tmp_path = kDriverStatePath ".tmp";
+    FILE* f = fopen(tmp_path, "wb");
+    if (f) {
+        fwrite(CFDataGetBytePtr(data), 1, (size_t)CFDataGetLength(data), f);
+        fflush(f);
+        fsync(fileno(f));
+        fclose(f);
+        // Atomic replace of the previous state file.
+        rename(tmp_path, kDriverStatePath);
+        // 0666: readable + writable by all, so a normal-user process (e.g.
+        // the SwiftUI app) can also inspect state without sudo.
+        chmod(kDriverStatePath, 0666);
+    }
+    CFRelease(data);
+}
+
+// Mark state dirty. Coalesces bursty volume-slider drags into one write.
+// Safe to call from any thread — the actual disk write happens on a
+// background dispatch queue 500 ms after the LAST call in a burst.
+static void driver_state_mark_dirty(void) {
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&g_state_save_pending, &expected, true)) {
+        // A save is already scheduled; this event coalesces into it.
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        atomic_store(&g_state_save_pending, false);
+        driver_state_write_synchronous();
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle methods.
 // ---------------------------------------------------------------------------
 
@@ -813,9 +961,17 @@ static OSStatus HonestEQ_Initialize(AudioServerPlugInDriverRef self,
     gDriver.host = host;
     gDriver.sample_rate = 48000.0;
     gDriver.buffer_frame_size = 512;   // AUHAL will override via SetProperty
-    gDriver.output_master_volume = 1.0f;
+    // Factory defaults — match Apple's convention across macOS/iOS:
+    // first-boot media volume is ~50%. Prevents ear-blasting the user the
+    // first time they select HonestEQ as system output. State persistence
+    // takes over immediately on any change, so this only ever matters at
+    // fresh install (no state file yet).
+    gDriver.output_master_volume = 0.5f;
     gDriver.output_master_mute = false;
     gDriver.io_running_count = 0;
+    // Restore volume/mute from disk if a state file exists. Silent if not —
+    // the values above are our defaults for first-boot.
+    driver_state_load();
     return kAudioHardwareNoError;
 }
 
@@ -1061,13 +1217,21 @@ static OSStatus HonestEQ_DoIOOperation(AudioServerPlugInDriverRef self,
 
     if (op == kAudioServerPlugInIOOperationWriteMix) {
         // Apply the driver's master volume + mute to incoming audio.
-        // The macOS system-volume slider talks to our master volume control,
-        // which stores here; we multiply on the way into the ring.
+        // Uses a cubic taper (g = vol^3) so the slider FEELS natural — slider
+        // at 30% sounds like ~30% loudness (perceptually) rather than 60%.
+        // Human hearing is logarithmic; linear-amplitude tapers sound too
+        // loud at moderate slider positions. Matches typical hardware pots
+        // and the "audio taper" convention.
+        //   vol = 1.00 → g = 1.000 →  0 dB (max)
+        //   vol = 0.80 → g = 0.512 → -6 dB
+        //   vol = 0.50 → g = 0.125 → -18 dB
+        //   vol = 0.30 → g = 0.027 → -31 dB
+        //   vol = 0.10 → g = 0.001 → -60 dB
         pthread_mutex_lock(&gDriver.state_mutex);
         const bool  muted = gDriver.output_master_mute;
         const float vol   = gDriver.output_master_volume;
         pthread_mutex_unlock(&gDriver.state_mutex);
-        const float g = muted ? 0.0f : vol;
+        const float g = muted ? 0.0f : (vol * vol * vol);
 
         const UInt64 base = (UInt64)info->mOutputTime.mSampleTime;
         for (UInt32 i = 0; i < frames; ++i) {

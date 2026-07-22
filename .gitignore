@@ -7,6 +7,20 @@ build-*/
 *.so
 *.driver
 
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+*.pcm
+*.swiftmodule
+*.swiftdoc
+*.swiftsourceinfo
+*.abi.json
+*.dSYM/
+
+# Runtime dumps
+/tmp/honesteq_daemon_in.wav
+
 # macOS
 .DS_Store
 

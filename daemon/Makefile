@@ -6,7 +6,7 @@ COMMON   := -arch arm64 -arch x86_64 -O2 -Wall -Wextra -Wno-unused-parameter \
 CFLAGS   := $(COMMON)
 CXXFLAGS := $(COMMON) -std=c++17 -I../dsp/include
 LDFLAGS  := -framework CoreAudio -framework AudioUnit -framework AudioToolbox \
-            -framework CoreFoundation
+            -framework CoreFoundation -framework IOKit
 
 C_SRC    := main.c
 CPP_SRC  := EqBridge.cpp

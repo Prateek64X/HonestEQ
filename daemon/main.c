@@ -26,17 +26,42 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <inttypes.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
+#include <IOKit/IOMessage.h>
 
 #include "EqBridge.hpp"
 
-// The DSP engine. Instantiated at startup, updated on rate changes.
-static EqBridge* gEq = NULL;
+// Command-line arg 1 (output device name) — kept in a global so device-
+// availability listeners can re-resolve the device object ID if it changes
+// (headphones unplug → replug scenarios).
+static const char* gOutputDeviceName = NULL;
+
+// The DSP engine. Instantiated at startup; live-swapped on SIGHUP
+// (hot-reload of the active profile) and rebuilt on sample-rate changes.
+//
+// Atomic pointer: the audio thread reads it lock-free once per block, the
+// main thread swaps a freshly-loaded bridge in via SIGHUP. Old bridges are
+// freed after a brief settle delay so no in-flight audio block can still
+// dereference them.
+static _Atomic(EqBridge*) gEq = NULL;
+
+// Path to the active profile file — remembered at startup so the SIGHUP
+// handler knows what to re-read. Also the CLI overrides, so a hot-swap
+// preserves them (a hot-swap without this would silently drop --preamp /
+// --intensity flags after every reload).
+static char   g_profile_path[1024];
+static double g_preamp_override_db      = 0.0;
+static bool   g_preamp_override_set     = false;
+static double g_intensity_override      = 1.0;
+static bool   g_intensity_override_set  = false;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -212,6 +237,10 @@ static AudioUnit setup_auhal(AudioObjectID device_id, int dir);
 static void      configure_input_callback(AudioUnit unit);
 static void      configure_output_callback(AudioUnit unit);
 static void      rebuild_pipeline(void);
+// Debounced wrapper — coalesces bursty listener fires so we don't
+// create multiple input AUHALs in quick succession (each one would
+// otherwise trigger a fresh microphone permission dialog).
+static void      schedule_debounced_rebuild(const char* reason);
 
 static void sync_honesteq_rate_to_output(void) {
     if (gHonestEQ_ID == kAudioObjectUnknown || gOutput_ID == kAudioObjectUnknown) return;
@@ -241,8 +270,11 @@ static void sync_honesteq_rate_to_output(void) {
     }
     if (gSampleRate == out_rate) return;
     gSampleRate = out_rate;
-    fprintf(stderr, "[rate] rebuilding AUHAL pipeline at %.1f Hz...\n", gSampleRate);
-    rebuild_pipeline();
+    fprintf(stderr, "[rate] output device rate changed to %.1f Hz — scheduling rebuild.\n",
+            gSampleRate);
+    // Debounced so a plug/unplug cascade (which fires this listener PLUS
+    // the device-list listener PLUS others) results in exactly one rebuild.
+    schedule_debounced_rebuild("rate change");
 }
 
 static OSStatus rate_change_listener(AudioObjectID id, UInt32 n,
@@ -424,7 +456,10 @@ static OSStatus input_callback(void* user_data,
 
     // Apply the EQ to the samples before they hit the ring. This keeps the
     // ring holding already-processed audio; the output side is pure playback.
-    eq_bridge_process_interleaved(gEq, scratch, frames);
+    // Atomic snapshot: SIGHUP may hot-swap the bridge, but we hold this
+    // pointer stable for the duration of this callback.
+    EqBridge* eq_snapshot = atomic_load_explicit(&gEq, memory_order_acquire);
+    eq_bridge_process_interleaved(eq_snapshot, scratch, frames);
 
     // Diagnostic tap: save the first ~15 seconds to a WAV for offline inspection.
     if (gDumpFramesLimit > 0 && gDumpFramesWritten < gDumpFramesLimit) {
@@ -558,7 +593,10 @@ static void rebuild_pipeline(void) {
     // Push the new rate into the DSP so all biquad coefficients get
     // recomputed for the new Fs. Filter shape is preserved; the analytic
     // response at any Hz is unchanged, but the discrete coefficients change.
-    if (gEq) eq_bridge_set_sample_rate(gEq, gSampleRate);
+    {
+        EqBridge* eq = atomic_load_explicit(&gEq, memory_order_acquire);
+        if (eq) eq_bridge_set_sample_rate(eq, gSampleRate);
+    }
 
     // Rebuild fresh at the new rate. make_asbd() reads gSampleRate.
     gInputUnit  = setup_auhal(gHonestEQ_ID, 1);
@@ -576,30 +614,463 @@ static void rebuild_pipeline(void) {
     fprintf(stderr, "[rate] pipeline rebuilt at %.1f Hz.\n", gSampleRate);
 }
 
+// True when we've detected the target output device is currently absent
+// (e.g. headphones unplugged). Declared here (near top of stability code)
+// because both the debounce logic and the watchdog reference it.
+static _Atomic bool gOutputDeviceMissing = false;
+
+// ---------------------------------------------------------------------------
+// Debounced rebuild.
+//
+// macOS fires many CoreAudio property listeners in cascade for a single
+// physical event (headphone plug/unplug fires kAudioHardwarePropertyDevices,
+// kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyName, and
+// several others in ~50 ms). Each listener naively calling rebuild_pipeline()
+// creates a fresh input AUHAL — and macOS shows the microphone permission
+// dialog once per new input AUHAL if permission isn't persistently granted.
+// Result: 6 "allow mic access" prompts per replug.
+//
+// Debounce coalesces every rebuild request within `kRebuildDebounceMs` into
+// a single pipeline rebuild, so one physical event → one AUHAL creation →
+// one prompt (at most, once ever if the user grants persistent permission).
+// ---------------------------------------------------------------------------
+#define kRebuildDebounceMs  300
+
+static _Atomic bool gRebuildScheduled = false;
+
+static void schedule_debounced_rebuild(const char* reason) {
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&gRebuildScheduled, &expected, true)) {
+        // Rebuild already pending; coalesce this request into it.
+        return;
+    }
+    fprintf(stderr, "[rebuild] scheduled in %d ms (reason: %s)\n",
+            kRebuildDebounceMs, reason ? reason : "unspecified");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, kRebuildDebounceMs * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        atomic_store(&gRebuildScheduled, false);
+        // Skip if device is legitimately missing — we'll rebuild on reconnect.
+        if (atomic_load(&gOutputDeviceMissing)) {
+            fprintf(stderr, "[rebuild] skipped — output device still missing.\n");
+            return;
+        }
+        rebuild_pipeline();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Power management — sleep/wake handling (A).
+//
+// When macOS sleeps, coreaudiod stops running the audio graph and our AUHAL
+// callbacks freeze mid-block. On wake, coreaudiod restarts but device object
+// IDs may have shifted and AUHALs held references to state that no longer
+// exists. Result without a handler: `AudioUnitRender` retry-storm, CPU spike
+// (the "laptop lag"), no audio.
+//
+// Fix: register IOKit power-management notifications. On wake, wait for
+// coreaudiod to settle (~500 ms), then rebuild both AUHALs cleanly against
+// current device state.
+// ---------------------------------------------------------------------------
+static io_connect_t          gPMRootPort   = 0;
+static IONotificationPortRef gPMNotifyPort = NULL;
+static io_object_t           gPMNotifier   = 0;
+
+static void power_callback(void* refcon, io_service_t service,
+                           natural_t msg_type, void* msg_arg) {
+    (void)refcon; (void)service;
+    switch (msg_type) {
+        case kIOMessageCanSystemSleep:
+            // Grant sleep unconditionally (we're not blocking anything critical).
+            IOAllowPowerChange(gPMRootPort, (long)msg_arg);
+            break;
+        case kIOMessageSystemWillSleep:
+            fprintf(stderr, "[power] system will sleep — stopping AUHALs.\n");
+            if (gInputUnit)  AudioOutputUnitStop(gInputUnit);
+            if (gOutputUnit) AudioOutputUnitStop(gOutputUnit);
+            IOAllowPowerChange(gPMRootPort, (long)msg_arg);
+            break;
+        case kIOMessageSystemHasPoweredOn:
+            fprintf(stderr, "[power] system woke — rebuilding audio pipeline (debounced).\n");
+            // Small delay so coreaudiod finishes its own recovery before we
+            // start rebuilding against it. Then re-resolve the output device
+            // by name (its ID may have shifted for USB/BT devices) and
+            // schedule a debounced rebuild — coalesces with any device-list
+            // events the wake will also generate, so we don't triple-prompt
+            // for microphone access.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                if (gOutputDeviceName) {
+                    CFStringRef nm = CFStringCreateWithCString(NULL, gOutputDeviceName,
+                                                               kCFStringEncodingUTF8);
+                    AudioObjectID fresh = find_device_by_name(nm);
+                    CFRelease(nm);
+                    if (fresh != kAudioObjectUnknown) gOutput_ID = fresh;
+                }
+                schedule_debounced_rebuild("wake");
+            });
+            break;
+        default:
+            break;
+    }
+}
+
+static void setup_power_notifications(void) {
+    gPMRootPort = IORegisterForSystemPower(NULL, &gPMNotifyPort,
+                                            power_callback, &gPMNotifier);
+    if (gPMRootPort == MACH_PORT_NULL) {
+        fprintf(stderr, "WARNING: could not register for power notifications.\n");
+        return;
+    }
+    CFRunLoopAddSource(CFRunLoopGetCurrent(),
+                       IONotificationPortGetRunLoopSource(gPMNotifyPort),
+                       kCFRunLoopCommonModes);
+    fprintf(stderr, "Power notifications registered — daemon self-recovers on wake.\n");
+}
+
+// ---------------------------------------------------------------------------
+// Device availability listener (B).
+//
+// Fires whenever the set of audio devices changes: user plugs/unplugs
+// headphones, connects/disconnects USB DAC, joins/leaves BT, etc. We check
+// whether OUR output device (headphones) is still present.
+//
+// Semantics for the three failure states the user might see:
+//   1. Device disappeared  → gOutput_ID no longer in device list.
+//                            Action: log, wait; on device return, rebuild.
+//   2. Device volume = 0   → device present, kAudioDevicePropertyVolumeScalar
+//                            reads 0. NOT a disconnect — daemon does nothing;
+//                            silence is correct behavior. macOS UI handles.
+//   3. No audio flowing    → device present, ring's write_frame counter isn't
+//                            advancing. Handled by watchdog (D), not here.
+// ---------------------------------------------------------------------------
+static bool device_still_present(AudioObjectID id) {
+    if (id == kAudioObjectUnknown) return false;
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain,
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &size) != noErr) {
+        return false;
+    }
+    UInt32 count = size / sizeof(AudioObjectID);
+    AudioObjectID* devices = calloc(count, sizeof(AudioObjectID));
+    if (!devices) return true;   // conservatively say present on OOM
+    OSStatus s = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr,
+                                            0, NULL, &size, devices);
+    bool present = false;
+    if (s == noErr) {
+        for (UInt32 i = 0; i < count; ++i) {
+            if (devices[i] == id) { present = true; break; }
+        }
+    }
+    free(devices);
+    return present;
+}
+
+static OSStatus device_list_changed(AudioObjectID id, UInt32 n,
+                                    const AudioObjectPropertyAddress addrs[],
+                                    void* user) {
+    (void)id; (void)n; (void)addrs; (void)user;
+    bool was_missing = atomic_load(&gOutputDeviceMissing);
+
+    // First try to re-resolve by name — object IDs shift when devices are
+    // disconnected and reconnected. `gOutput_ID` may point at stale state.
+    AudioObjectID fresh = kAudioObjectUnknown;
+    if (gOutputDeviceName) {
+        CFStringRef nm = CFStringCreateWithCString(NULL, gOutputDeviceName,
+                                                   kCFStringEncodingUTF8);
+        fresh = find_device_by_name(nm);
+        CFRelease(nm);
+    }
+
+    if (fresh == kAudioObjectUnknown || !device_still_present(fresh)) {
+        // Device is gone.
+        if (!was_missing) {
+            fprintf(stderr, "[device] output '%s' disconnected — pausing pipeline.\n",
+                    gOutputDeviceName ? gOutputDeviceName : "(unknown)");
+            if (gOutputUnit) AudioOutputUnitStop(gOutputUnit);
+            if (gInputUnit)  AudioOutputUnitStop(gInputUnit);
+            atomic_store(&gOutputDeviceMissing, true);
+        }
+        return noErr;
+    }
+
+    // Device is present. If the ID changed or we were previously missing,
+    // rebuild the pipeline against the fresh ID. Uses the debounced rebuild
+    // so cascaded listener fires (a single plug/unplug can fire the device
+    // list listener 3-6 times in quick succession) coalesce into ONE actual
+    // rebuild — which means ONE input-AUHAL creation, which means at most
+    // ONE microphone permission prompt.
+    if (fresh != gOutput_ID || was_missing) {
+        fprintf(stderr, "[device] output '%s' available (id=%u%s) — scheduling rebuild.\n",
+                gOutputDeviceName ? gOutputDeviceName : "(unknown)",
+                fresh,
+                was_missing ? ", after reconnect" : "");
+        gOutput_ID = fresh;
+        atomic_store(&gOutputDeviceMissing, false);
+        schedule_debounced_rebuild(was_missing ? "device reconnect" : "device id changed");
+    }
+    return noErr;
+}
+
+static void setup_device_availability_listener(void) {
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain,
+    };
+    OSStatus s = AudioObjectAddPropertyListener(kAudioObjectSystemObject, &addr,
+                                                device_list_changed, NULL);
+    if (s != noErr) {
+        fprintf(stderr, "WARNING: could not register device-list listener (status=%d).\n", (int)s);
+    } else {
+        fprintf(stderr, "Device availability listener registered — auto-pauses on unplug, resumes on replug.\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SIGHUP-triggered profile hot-swap.
+//
+// Reloads g_profile_path into a FRESH EqBridge, then atomically publishes it
+// to the audio thread. The old bridge is destroyed after a short settle
+// delay (comfortably longer than any single audio block currently in flight)
+// so no reader can still be holding it.
+//
+// Audio does NOT stop during the swap — the biquad state resets to zero on
+// the new bridge, but that discontinuity is inaudible (a few samples of
+// filter warmup, ~1 ms). Zero pops, zero silence.
+//
+// Trigger from anywhere:  pkill -HUP honesteq-daemon
+// ---------------------------------------------------------------------------
+static void reload_active_profile(void) {
+    EqBridge* fresh = eq_bridge_create(gSampleRate);
+    if (!fresh) {
+        fprintf(stderr, "[reload] failed to allocate new EQ bridge.\n");
+        return;
+    }
+    if (eq_bridge_load_profile(fresh, g_profile_path) != 0 ||
+        !eq_bridge_has_profile(fresh)) {
+        fprintf(stderr, "[reload] could not parse %s — keeping current profile.\n",
+                g_profile_path);
+        eq_bridge_destroy(fresh);
+        return;
+    }
+    // Re-apply CLI overrides so hot-swap doesn't silently lose them.
+    if (g_preamp_override_set)    eq_bridge_set_preamp_db(fresh, g_preamp_override_db);
+    if (g_intensity_override_set) eq_bridge_set_intensity(fresh, g_intensity_override);
+
+    // Publish the new bridge to the audio thread.
+    EqBridge* old = atomic_exchange_explicit(&gEq, fresh, memory_order_acq_rel);
+
+    // Wait longer than any single audio block could plausibly be in flight
+    // (128 frames = 2.7 ms at 48 kHz; 50 ms is a very safe upper bound
+    // across all supported rates plus scheduler jitter).
+    usleep(50 * 1000);
+    if (old) eq_bridge_destroy(old);
+
+    fprintf(stderr, "[reload] hot-swap complete — bands=%d, preamp=%+.2f dB (%s)\n",
+            eq_bridge_band_count(fresh),
+            eq_bridge_preamp_db(fresh),
+            g_profile_path);
+}
+
+// ---------------------------------------------------------------------------
+// Daemon state persistence.
+//
+// Persists the user's chosen output-device name (and later, other daemon-
+// scoped preferences) to disk so a bare `honesteq-daemon` with no args on
+// next boot resumes to the same device. Writes go to:
+//   ~/Library/Application Support/HonestEQ/daemon-state.plist
+//
+// Priority order for resolving the target device at daemon startup:
+//   1. CLI arg   `./honesteq-daemon "Some Device"`   (explicit override)
+//   2. state.plist → outputDeviceName                (persisted choice)
+//   3. macOS default output device (fallback, user gets a warning log)
+//
+// Writes debounce the same way the driver's state does, so a future UI
+// button that scrubs the device list doesn't hammer the disk.
+// ---------------------------------------------------------------------------
+
+static char g_daemon_state_path[1024];
+static _Atomic bool g_daemon_state_save_pending = false;
+
+static void daemon_state_path_init(void) {
+    const char* home = getenv("HOME");
+    snprintf(g_daemon_state_path, sizeof(g_daemon_state_path),
+             "%s/Library/Application Support/HonestEQ/daemon-state.plist",
+             home ? home : "/tmp");
+}
+
+// Ensure the parent directory exists (idempotent).
+static void daemon_state_ensure_dir(void) {
+    const char* home = getenv("HOME");
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s/Library/Application Support/HonestEQ",
+             home ? home : "/tmp");
+    mkdir(dir, 0755);
+}
+
+// Read the persisted device name into a caller-provided buffer.
+// Returns true on success, false if no persisted value.
+static bool daemon_state_load_output_device(char* out, size_t out_size) {
+    if (g_daemon_state_path[0] == '\0') daemon_state_path_init();
+
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+        NULL, (const UInt8*)g_daemon_state_path, strlen(g_daemon_state_path), false);
+    if (!url) return false;
+
+    CFReadStreamRef stream = CFReadStreamCreateWithFile(NULL, url);
+    CFRelease(url);
+    if (!stream || !CFReadStreamOpen(stream)) {
+        if (stream) CFRelease(stream);
+        return false;
+    }
+
+    CFPropertyListRef plist = CFPropertyListCreateWithStream(
+        NULL, stream, 0, kCFPropertyListImmutable, NULL, NULL);
+    CFReadStreamClose(stream);
+    CFRelease(stream);
+    if (!plist) return false;
+    if (CFGetTypeID(plist) != CFDictionaryGetTypeID()) {
+        CFRelease(plist);
+        return false;
+    }
+
+    CFDictionaryRef dict = (CFDictionaryRef)plist;
+    CFStringRef name = (CFStringRef)CFDictionaryGetValue(dict, CFSTR("outputDeviceName"));
+    bool ok = false;
+    if (name && CFGetTypeID(name) == CFStringGetTypeID()) {
+        if (CFStringGetCString(name, out, (CFIndex)out_size, kCFStringEncodingUTF8)) {
+            ok = true;
+        }
+    }
+    CFRelease(plist);
+    return ok;
+}
+
+// Serialize the current device name to disk. Atomic write via .tmp + rename.
+static void daemon_state_write_synchronous(void) {
+    if (g_daemon_state_path[0] == '\0') daemon_state_path_init();
+    if (gOutputDeviceName == NULL || gOutputDeviceName[0] == '\0') return;
+
+    daemon_state_ensure_dir();
+
+    CFMutableDictionaryRef dict = CFDictionaryCreateMutable(
+        NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (!dict) return;
+    CFStringRef name = CFStringCreateWithCString(
+        NULL, gOutputDeviceName, kCFStringEncodingUTF8);
+    if (name) {
+        CFDictionarySetValue(dict, CFSTR("outputDeviceName"), name);
+        CFRelease(name);
+    }
+    CFDataRef data = CFPropertyListCreateData(
+        NULL, dict, kCFPropertyListXMLFormat_v1_0, 0, NULL);
+    CFRelease(dict);
+    if (!data) return;
+
+    char tmp_path[1200];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", g_daemon_state_path);
+    FILE* f = fopen(tmp_path, "wb");
+    if (f) {
+        fwrite(CFDataGetBytePtr(data), 1, (size_t)CFDataGetLength(data), f);
+        fflush(f);
+        fsync(fileno(f));
+        fclose(f);
+        rename(tmp_path, g_daemon_state_path);
+    }
+    CFRelease(data);
+}
+
+// Debounced save: coalesces bursty updates. Same pattern as rebuild debounce.
+static void daemon_state_mark_dirty(void) {
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&g_daemon_state_save_pending, &expected, true)) {
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        atomic_store(&g_daemon_state_save_pending, false);
+        daemon_state_write_synchronous();
+    });
+}
+
+// Flush on clean shutdown so a last-second change isn't lost.
+static void daemon_state_flush_at_exit(void) {
+    if (atomic_load(&g_daemon_state_save_pending)) {
+        daemon_state_write_synchronous();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        fprintf(stderr,
-            "usage: %s <output-device-name> [--preamp DB]\n"
-            "  e.g. %s \"External Headphones\"\n"
-            "       %s \"External Headphones\" --preamp -6\n\n",
-            argv[0], argv[0], argv[0]);
-        list_devices();
-        return 1;
-    }
+    daemon_state_path_init();
+    atexit(daemon_state_flush_at_exit);
 
-    // Optional --preamp flag to override whatever the profile says.
-    double preamp_override_db = 0.0;
+    // Optional CLI overrides for preamp and intensity.
+    double preamp_override_db  = 0.0;
     bool   preamp_override_set = false;
-    for (int i = 2; i < argc; ++i) {
+    double intensity_override  = 1.0;
+    bool   intensity_set       = false;
+
+    // Parse args starting at index 1 — first positional non-flag arg (if any)
+    // is treated as the output device name. Flags (--preamp / --intensity)
+    // can appear anywhere. Everything is optional now: if no device is given,
+    // we fall back to the persisted state, then to the macOS default output.
+    const char* cli_device = NULL;
+    for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--preamp") == 0 && i + 1 < argc) {
             preamp_override_db = atof(argv[++i]);
             preamp_override_set = true;
+        } else if (strcmp(argv[i], "--intensity") == 0 && i + 1 < argc) {
+            intensity_override = atof(argv[++i]);
+            intensity_set = true;
+        } else if (argv[i][0] != '-') {
+            // First positional arg wins as device name; ignore later ones.
+            if (cli_device == NULL) cli_device = argv[i];
         }
     }
+
+    // Resolve target device: CLI arg → persisted state → macOS default.
+    // Note: static buffer so gOutputDeviceName can point at it for the
+    // process lifetime (device-availability + power listeners read it).
+    static char resolved_device_name[256];
+    if (cli_device) {
+        snprintf(resolved_device_name, sizeof(resolved_device_name), "%s", cli_device);
+    } else if (daemon_state_load_output_device(resolved_device_name,
+                                               sizeof(resolved_device_name))) {
+        fprintf(stderr, "Using persisted output device: '%s'\n", resolved_device_name);
+    } else {
+        // Neither CLI nor state — show usage and exit so the user picks.
+        fprintf(stderr,
+            "usage: %s [<output-device-name>] [--preamp DB] [--intensity FRACTION]\n"
+            "  <output-device-name>  target output device (optional if a persisted\n"
+            "                        state file exists at\n"
+            "                        ~/Library/Application Support/HonestEQ/daemon-state.plist)\n"
+            "  --preamp DB           override profile's preamp (dB, e.g. -6)\n"
+            "  --intensity FRACTION  scale every band gain, default 1.0 = 100%%\n"
+            "                        0.5 = half strength, 0.0 = passthrough, 1.5 = 50%% stronger\n\n"
+            "  e.g. %s \"External Headphones\"\n"
+            "       %s \"External Headphones\" --preamp -6\n"
+            "       %s \"External Headphones\" --intensity 0.7\n\n",
+            argv[0], argv[0], argv[0], argv[0]);
+        list_devices();
+        return 1;
+    }
+    // Remember the target device name so device-availability + power
+    // callbacks can re-resolve it after disconnect/wake.
+    gOutputDeviceName = resolved_device_name;
+
+    // Persist the resolved choice (debounced) so a bare `honesteq-daemon`
+    // on next start reuses it. If it hasn't changed, this is essentially a
+    // no-op (the debounce fires 500ms after the last change and the disk
+    // write is small).
+    daemon_state_mark_dirty();
 
     // Find HonestEQ (the source of audio we consume).
     AudioObjectID honesteq = find_device_by_uid(kHonestEQ_UID);
@@ -610,17 +1081,43 @@ int main(int argc, char** argv) {
     }
     fprintf(stderr, "HonestEQ device found (id=%u)\n", honesteq);
 
-    // Find the real output device by name from the CLI arg.
-    CFStringRef target = CFStringCreateWithCString(NULL, argv[1], kCFStringEncodingUTF8);
+    // Find the real output device by name from the resolved name.
+    // Startup retry loop — cover two real-world cases:
+    //   (a) launchd loads us at login before coreaudiod has fully enumerated
+    //       the device topology → transient "not found" that resolves in
+    //       ~1-3 s. Without retry we'd bail here and enter a launchd
+    //       restart loop.
+    //   (b) User's headphones happen to be unplugged when the daemon starts
+    //       (came back from sleep, computer moved) → device appears within
+    //       tens of seconds when re-plugged. Waiting gracefully is better
+    //       UX than exit + relaunch.
+    //
+    // Poll every 500 ms for up to 30 s. If still not found, exit(3) —
+    // launchd's own 3 s throttle then handles the retry across restart.
+    CFStringRef target = CFStringCreateWithCString(NULL, gOutputDeviceName, kCFStringEncodingUTF8);
     AudioObjectID output_dev = find_device_by_name(target);
     if (output_dev == kAudioObjectUnknown) {
-        fprintf(stderr, "ERROR: no device named '%s'.\n\n", argv[1]);
+        fprintf(stderr, "Output device '%s' not present yet — waiting up to 30 s...\n",
+                gOutputDeviceName);
+        for (int attempt = 0; attempt < 60; ++attempt) {   // 60 × 500 ms = 30 s
+            usleep(500 * 1000);
+            output_dev = find_device_by_name(target);
+            if (output_dev != kAudioObjectUnknown) {
+                fprintf(stderr, "  ...appeared after %.1f s.\n",
+                        (double)(attempt + 1) * 0.5);
+                break;
+            }
+        }
+    }
+    if (output_dev == kAudioObjectUnknown) {
+        fprintf(stderr, "ERROR: no device named '%s' after 30 s wait.\n\n",
+                gOutputDeviceName);
         list_devices();
         CFRelease(target);
         return 3;
     }
     CFRelease(target);
-    fprintf(stderr, "Output device '%s' found (id=%u)\n", argv[1], output_dev);
+    fprintf(stderr, "Output device '%s' found (id=%u)\n", gOutputDeviceName, output_dev);
 
     // Query both devices' current rates.
     Float64 honesteq_rate = 0, out_rate = 0;
@@ -641,7 +1138,7 @@ int main(int argc, char** argv) {
     gOutput_ID   = output_dev;
 
     fprintf(stderr, "Initial rates: HonestEQ = %.1f Hz, %s = %.1f Hz\n",
-            honesteq_rate, argv[1], out_rate);
+            honesteq_rate, gOutputDeviceName, out_rate);
 
     // Force HonestEQ to match the output device's current rate.
     // This makes the entire pipeline single-rate → no SRC anywhere → bit-perfect.
@@ -681,29 +1178,41 @@ int main(int argc, char** argv) {
     // Default location: ~/Library/Application Support/HonestEQ/active_profile.txt
     // If missing, daemon runs as passthrough (still applies rate-following
     // and clean routing, just no filtering).
-    gEq = eq_bridge_create(gSampleRate);
-    if (gEq == NULL) {
+    EqBridge* initial_eq = eq_bridge_create(gSampleRate);
+    if (initial_eq == NULL) {
         fprintf(stderr, "ERROR: failed to create EQ engine.\n");
         return 4;
     }
-    char profile_path[1024];
     const char* home = getenv("HOME");
-    snprintf(profile_path, sizeof(profile_path),
+    snprintf(g_profile_path, sizeof(g_profile_path),
              "%s/Library/Application Support/HonestEQ/active_profile.txt",
              home ? home : "/tmp");
-    if (eq_bridge_load_profile(gEq, profile_path) == 0 &&
-        eq_bridge_has_profile(gEq)) {
-        fprintf(stderr, "EQ profile loaded: %s\n", profile_path);
+    if (eq_bridge_load_profile(initial_eq, g_profile_path) == 0 &&
+        eq_bridge_has_profile(initial_eq)) {
+        fprintf(stderr, "EQ profile loaded: %s\n", g_profile_path);
         fprintf(stderr, "  Bands: %d, Preamp: %+.2f dB\n",
-                eq_bridge_band_count(gEq), eq_bridge_preamp_db(gEq));
+                eq_bridge_band_count(initial_eq), eq_bridge_preamp_db(initial_eq));
     } else {
-        fprintf(stderr, "No EQ profile at %s — running passthrough.\n", profile_path);
+        fprintf(stderr, "No EQ profile at %s — running passthrough.\n", g_profile_path);
         fprintf(stderr, "  Drop a Peace/Equalizer APO config there and restart the daemon.\n");
     }
     if (preamp_override_set) {
-        eq_bridge_set_preamp_db(gEq, preamp_override_db);
+        eq_bridge_set_preamp_db(initial_eq, preamp_override_db);
         fprintf(stderr, "  Preamp overridden via --preamp: %+.2f dB\n", preamp_override_db);
+        // Remember so hot-reload preserves it.
+        g_preamp_override_db  = preamp_override_db;
+        g_preamp_override_set = true;
     }
+    if (intensity_set) {
+        eq_bridge_set_intensity(initial_eq, intensity_override);
+        fprintf(stderr, "  Intensity overridden via --intensity: %.2f (%.0f%%)\n",
+                intensity_override, intensity_override * 100.0);
+        g_intensity_override     = intensity_override;
+        g_intensity_override_set = true;
+    }
+    // Publish to the audio thread. Must happen BEFORE AudioOutputUnitStart
+    // so the input callback never sees a NULL bridge.
+    atomic_store_explicit(&gEq, initial_eq, memory_order_release);
     // ---------------------------------------------------------------------
     if ((Float64)gSampleRate != out_rate) {
         fprintf(stderr, "  Note: rates differ — AUHAL will resample internally.\n");
@@ -763,14 +1272,19 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (eq_bridge_has_profile(gEq)) {
+    // Stability handlers — sleep/wake (A), device availability (B).
+    // The watchdog (D) is set up alongside the stats timer further down.
+    setup_power_notifications();
+    setup_device_availability_listener();
+
+    if (eq_bridge_has_profile(initial_eq)) {
         fprintf(stderr, "HonestEQ daemon running — DSP active (%d bands, preamp %+0.2f dB).\n",
-                eq_bridge_band_count(gEq), eq_bridge_preamp_db(gEq));
+                eq_bridge_band_count(initial_eq), eq_bridge_preamp_db(initial_eq));
     } else {
         fprintf(stderr, "HonestEQ daemon running — passthrough (no profile loaded).\n");
     }
     fprintf(stderr, "Select 'HonestEQ' as system output; audio will come out of '%s'.\n"
-                    "Press Ctrl-C to stop.\n\n", argv[1]);
+                    "Press Ctrl-C to stop.\n\n", gOutputDeviceName);
 
     // Diagnostic thread: print ring stats every 2 seconds.
     dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
@@ -778,6 +1292,15 @@ int main(int argc, char** argv) {
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                               2 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
     static uint64_t prev_underruns = 0, prev_read = 0, prev_written = 0;
+    // Watchdog (D): if no audio has flowed through the input side for
+    // kWatchdogStallTimeoutTicks consecutive ticks (2 s each), the pipeline
+    // is stuck (typically post-wake, mid-driver reload, or a CoreAudio hiccup
+    // the other handlers didn't catch). We exit(2) and let launchd relaunch
+    // us — cleanest possible recovery. If the output device is legitimately
+    // missing (checked via gOutputDeviceMissing), we skip the watchdog since
+    // paused-on-purpose isn't a bug.
+    static const int kWatchdogStallTimeoutTicks = 5;   // 5 × 2 s = 10 s
+    static int  watchdog_stall_ticks = 0;
     dispatch_source_set_event_handler(timer, ^{
         uint64_t u = atomic_load(&gRing.underrun_count);
         uint64_t r = atomic_load(&gRing.total_read);
@@ -799,9 +1322,48 @@ int main(int argc, char** argv) {
                 (unsigned long long)d_w,
                 (double)pi / 1000000.0,
                 (double)po / 1000000.0);
+
+        // --- Watchdog ---
+        bool device_gone = atomic_load(&gOutputDeviceMissing);
+        if (device_gone) {
+            watchdog_stall_ticks = 0;   // paused-on-purpose, not stuck
+        } else if (d_w == 0) {
+            watchdog_stall_ticks++;
+            fprintf(stderr, "[watchdog] no input frames this tick (%d/%d)\n",
+                    watchdog_stall_ticks, kWatchdogStallTimeoutTicks);
+            if (watchdog_stall_ticks >= kWatchdogStallTimeoutTicks) {
+                fprintf(stderr, "[watchdog] pipeline stuck %d s — exiting for launchd to restart.\n",
+                        kWatchdogStallTimeoutTicks * 2);
+                fflush(stderr);
+                _exit(2);
+            }
+        } else {
+            watchdog_stall_ticks = 0;
+        }
+
         prev_underruns = u; prev_read = r; prev_written = w;
     });
     dispatch_resume(timer);
+
+    // ---- SIGHUP → hot-swap active profile --------------------------------
+    // libdispatch takes over signal delivery once SIGHUP is set to SIG_IGN;
+    // the block below runs on a background dispatch queue (NOT the audio
+    // thread), so file IO in reload_active_profile is safe.
+    //
+    // Trigger from anywhere with:  pkill -HUP honesteq-daemon
+    // A/B two profiles instantly:
+    //   cp profiles/A.txt ~/Library/Application\ Support/HonestEQ/active_profile.txt
+    //   pkill -HUP honesteq-daemon
+    //   # ...listen...
+    //   cp profiles/B.txt ~/Library/Application\ Support/HonestEQ/active_profile.txt
+    //   pkill -HUP honesteq-daemon
+    signal(SIGHUP, SIG_IGN);
+    dispatch_source_t sig_src = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_SIGNAL, SIGHUP, 0,
+        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    dispatch_source_set_event_handler(sig_src, ^{ reload_active_profile(); });
+    dispatch_resume(sig_src);
+    fprintf(stderr, "SIGHUP handler installed — `pkill -HUP honesteq-daemon` hot-reloads the active profile.\n");
 
     // Run forever — CoreAudio handles the audio threads for us.
     CFRunLoopRun();

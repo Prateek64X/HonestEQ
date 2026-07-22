@@ -45,6 +45,15 @@ double    eq_bridge_preamp_db(const EqBridge* eq);
 // specified. Useful for a --preamp CLI flag or a future GUI slider.
 void      eq_bridge_set_preamp_db(EqBridge* eq, double db);
 
+// EQ intensity — scales every band gain (and the preamp) by this factor.
+// 1.0 = full EQ as specified in the profile (default).
+// 0.0 = passthrough (EQ effectively disabled).
+// 0.5 = half strength (a +6 dB band becomes +3 dB, a -4 dB cut becomes -2 dB).
+// 1.5 = exaggerated (50% stronger than the profile).
+// Clamped at 0.0 minimum; upper bound is your call.
+void      eq_bridge_set_intensity(EqBridge* eq, double intensity);
+double    eq_bridge_intensity(const EqBridge* eq);
+
 #ifdef __cplusplus
 }
 #endif

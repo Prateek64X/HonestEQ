@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.honesteq.daemon</string>
+
+    <!--
+      Program only — no device arg. The daemon reads the target output-device
+      name from its state.plist:
+        ~/Library/Application Support/HonestEQ/daemon-state.plist
+      So the SwiftUI app (or `honesteq-daemon "Some Device"` for a one-off
+      manual run) can change the device without editing this plist and
+      unloading/reloading launchd.
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/prateekpanwar/PP Work/HonestEQ/daemon/build/honesteq-daemon</string>
+    </array>
+
+    <!-- Start when launchd loads this plist (typically at login). -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      Restart the daemon if it exits with non-zero status (i.e. crash or
+      watchdog-triggered exit). SuccessfulExit=false means "not restarting
+      on clean exit" — so `killall honesteq-daemon` still works.
+    -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Wait at least 3 s between restart attempts (prevents restart storms). -->
+    <key>ThrottleInterval</key>
+    <integer>3</integer>
+
+    <!-- Route all output to a log file so we can inspect after unattended runs. -->
+    <key>StandardOutPath</key>
+    <string>/tmp/honesteq-daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/honesteq-daemon.log</string>
+
+    <!--
+      Ensure the daemon runs under the user's environment (some Apple audio
+      APIs need HOME to resolve ~/Library paths for the active profile).
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/prateekpanwar</string>
+    </dict>
+
+    <!--
+      Nice value 0 (default). We rely on CoreAudio's real-time thread class
+      for audio priority, not process nice level.
+    -->
+    <key>Nice</key>
+    <integer>0</integer>
+
+    <!-- Don't background — launchd needs to see it running. -->
+    <key>AbandonProcessGroup</key>
+    <false/>
+</dict>
+</plist>

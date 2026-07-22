@@ -29,9 +29,17 @@ sudo cp -R "$BUNDLE" "$DEST"
 sudo chown -R root:wheel "$DEST"
 sudo chmod -R 755 "$DEST"
 
+echo "Preparing state directory (for persistent volume/mute + daemon config)..."
+STATE_DIR="/Library/Application Support/HonestEQ"
+sudo mkdir -p "$STATE_DIR"
+# 0777 so both coreaudiod (running as _coreaudiod) and the user's daemon
+# can write freely into it. The state file itself is chmod 0666 on write.
+sudo chmod 0777 "$STATE_DIR"
+
 echo "Restarting coreaudiod ..."
 sudo killall -9 coreaudiod || true
 
 echo ""
 echo "Install complete. Open System Settings -> Sound -> Output."
-echo "You should see 'HonestEQ' in the list (audio routing not active yet — pass 2 adds the device & stream property model)."
+echo "You should see 'HonestEQ' in the list."
+echo "Volume + mute now persist across coreaudiod restarts via $STATE_DIR/driver-state.plist."

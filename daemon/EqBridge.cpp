@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 // Max samples the bridge will process in a single call. 4096 frames × 2
 // channels = 8192 doubles = 64 KB static per bridge. AUHAL callbacks are
@@ -20,8 +21,26 @@ struct EqBridge {
     double                scratch[kMaxScratchSamples];
     bool                  has_profile = false;
     int                   band_count  = 0;
-    double                preamp_db   = 0.0;
+    double                preamp_db   = 0.0;    // effective (orig * intensity)
+
+    // Originals — kept so we can re-scale when intensity changes without
+    // needing to re-parse the profile from disk.
+    std::vector<honesteq::BandSpec> orig_bands;
+    double                          orig_preamp_db = 0.0;
+    double                          intensity      = 1.0;   // 1.0 = full EQ
 };
+
+// Push the "orig * intensity" set into the biquad chain.
+// Called any time the original bands, original preamp, or intensity changes.
+static void eq_bridge_apply_intensity(EqBridge* eq) {
+    std::vector<honesteq::BandSpec> scaled = eq->orig_bands;
+    for (auto& b : scaled) {
+        b.gainDb = b.gainDb * eq->intensity;
+    }
+    eq->chain.setBands(scaled);
+    eq->preamp_db = eq->orig_preamp_db * eq->intensity;
+    eq->chain.setPreampDb(eq->preamp_db);
+}
 
 extern "C" EqBridge* eq_bridge_create(double sample_rate) {
     auto* eq = new (std::nothrow) EqBridge{};
@@ -43,15 +62,16 @@ extern "C" int eq_bridge_load_profile(EqBridge* eq, const char* path) {
         eq->has_profile = false;
         eq->band_count = 0;
         eq->preamp_db = 0.0;
-        eq->chain.setBands({});
-        eq->chain.setPreampDb(0.0);
+        eq->orig_bands.clear();
+        eq->orig_preamp_db = 0.0;
+        eq_bridge_apply_intensity(eq);   // clears the chain
         return 1;
     }
-    eq->chain.setBands(profile.bands);
-    eq->chain.setPreampDb(profile.preampDb);
-    eq->has_profile = !profile.bands.empty();
-    eq->band_count  = (int)profile.bands.size();
-    eq->preamp_db   = profile.preampDb;
+    eq->orig_bands     = profile.bands;
+    eq->orig_preamp_db = profile.preampDb;
+    eq->has_profile    = !profile.bands.empty();
+    eq->band_count     = (int)profile.bands.size();
+    eq_bridge_apply_intensity(eq);
     return 0;
 }
 
@@ -90,6 +110,18 @@ extern "C" double eq_bridge_preamp_db(const EqBridge* eq) {
 
 extern "C" void eq_bridge_set_preamp_db(EqBridge* eq, double db) {
     if (!eq) return;
-    eq->preamp_db = db;
-    eq->chain.setPreampDb(db);
+    // Replaces the "original" preamp — intensity still applies on top.
+    eq->orig_preamp_db = db;
+    eq_bridge_apply_intensity(eq);
+}
+
+extern "C" void eq_bridge_set_intensity(EqBridge* eq, double intensity) {
+    if (!eq) return;
+    if (intensity < 0.0) intensity = 0.0;
+    eq->intensity = intensity;
+    eq_bridge_apply_intensity(eq);
+}
+
+extern "C" double eq_bridge_intensity(const EqBridge* eq) {
+    return eq ? eq->intensity : 1.0;
 }
